@@ -1,0 +1,72 @@
+import json
+import boto3
+from botocore.client import Config
+import os
+
+AWS_ACCESS_KEY = os.environ['ACCESS_KEY']
+AWS_SECRET_KEY = os.environ['SECRET_KEY']
+AWS_TIMESTREAM_DB = os.environ['AWS_TIMESTREAM_DB']
+AWS_TABLE_NAME = os.environ['AWS_TABLE_NAME']
+
+
+def aws_timestream_query():
+    query_client = boto3.client(
+        'timestream-query',
+        aws_access_key_id= AWS_ACCESS_KEY,
+        aws_secret_access_key= AWS_SECRET_KEY,
+        config=Config(region_name='eu-west-1'))
+    return query_client
+
+
+def aws_timestream_handler(database, table, deviceName):
+    query_client = aws_timestream_query()
+    paginator = query_client.get_paginator("query")
+    query = f"""
+        with raw_data AS (
+            SELECT max(time) as time,
+                max_by(measure_value::double, time) AS Peizometer
+            FROM "{database}"."{table}"
+            WHERE measure_name = 'peizometer'
+            AND deviceName = '{deviceName}'
+            AND time > ago(1h)
+        ),
+        calc_data AS (
+            SELECT
+                time,
+                BE, PD, Off,
+                LEAD(time) OVER (ORDER BY time) AS next_change_timestamp
+            FROM "{database}"."{table}"
+            WHERE measure_name = 'peizometer_multi'
+            AND deviceName = '{deviceName}'
+        )
+        SELECT c.BE - c.PD - c.Off AS AbsWaterLevelElevation
+        FROM raw_data r
+        INNER JOIN calc_data c
+        ON (r.time < c.next_change_timestamp OR c.next_change_timestamp IS NULL)
+        ORDER BY r.time DESC
+        """
+    pag_response = paginator.paginate(QueryString=query)
+    absValue = []
+    for page in pag_response:
+        column_info = page['Rows']
+        for row in column_info:
+            ans = row['Data']
+            absValue.append(ans[0]['ScalarValue'])
+    return absValue
+
+
+def lambda_handler(event, context):
+    deviceName = event['deviceName']
+    final_data = aws_timestream_handler(AWS_TIMESTREAM_DB, AWS_TABLE_NAME, deviceName)
+    return {
+        'statusCode': '200',
+        # 'body': json.dumps(final_data),
+        'body': final_data,
+        'headers': {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET',
+        'Access-Control-Allow-Headers': 'Content-Type, Access-Control-Allow-Headers, Authorization, X-Requested-With'
+    },
+    }
